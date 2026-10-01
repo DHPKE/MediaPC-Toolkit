@@ -10,7 +10,8 @@
       * -WhatIf dry run (nothing is changed, everything is logged)
       * System Restore point + .reg exports of touched keys before the first change
       * Every action is logged to a timestamped file on the system drive
-      * Does NOT touch UAC, does NOT disable the firewall, does NOT delete user data
+      * Does NOT touch UAC, does NOT disable the firewall, does NOT delete user files
+        (AppX removal in section 8 does remove those apps' own data)
 
     Sections
       2  Power: dedicated "24-7 Playout" plan, no sleep/hibernate/Fast Startup, no core
@@ -25,6 +26,7 @@
       9  Resilience: crash dialogs off, BSOD auto-reboot, watchdog task, optional daily reboot
       10 Auto-logon (kept OUT of "Run all" because it stores a credential)
       11 Post-install checklist (NVIDIA driver/control panel, BIOS)
+      13 Verify: show the current power plan, task, service and policy state
 
     -Aggressive additionally: disables update services, the search indexer, Defender's
     scheduled scan, memory compression, and Memory Integrity/VBS. Use on dedicated,
@@ -67,7 +69,7 @@
     Extra AppX package names that debloat must not remove.
 
 .PARAMETER AutoLogonUserName / AutoLogonDomain / AutoLogonPassword / AutoLogonMethod / AutologonExePath
-    Section 10. 'Registry' stores the password in PLAINTEXT under Winlogon.
+    Section 10. Default is 'Sysinternals'. 'Registry' stores the password in PLAINTEXT under Winlogon.
     'Sysinternals' uses Microsoft's Autologon tool (encrypted LSA secret); supply the path to
     a copy of Autologon64.exe you downloaded yourself. The password is passed on its command
     line for a moment, so run it on a trusted console.
@@ -97,7 +99,7 @@ param(
     [string]$AutoLogonUserName,
     [string]$AutoLogonDomain,
     [System.Security.SecureString]$AutoLogonPassword,
-    [ValidateSet('Registry','Sysinternals')][string]$AutoLogonMethod = 'Registry',
+    [ValidateSet('Registry','Sysinternals')][string]$AutoLogonMethod = 'Sysinternals',
     [string]$AutologonExePath
 )
 
@@ -129,11 +131,27 @@ function Invoke-Action {
     param([string]$Description, [scriptblock]$Action)
     if ($WhatIf) { Write-Log "WOULD: $Description" 'DRY'; return }
     try {
+        $ErrorActionPreference = 'Stop'   # non-terminating errors must not be logged as success
         & $Action | Out-Null
         Write-Log $Description 'ACTION'
     } catch {
         Write-Log "FAILED: $Description -- $($_.Exception.Message)" 'ERROR'
     }
+}
+
+# Run a native command; throw on non-zero exit code, return its output as text.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    if ($code -ne 0) { throw "$Exe $($Arguments -join ' ') failed (exit $code): $($out -join ' ')" }
+    return ($out -join "`n")
 }
 
 function Set-Reg {
@@ -217,9 +235,17 @@ function New-SafetyBackup {
     if ($WhatIf) { Write-Log "WOULD: create restore point and export touched registry keys" 'DRY'; return }
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
-        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' 'SystemRestorePointCreationFrequency' 0
-        Checkpoint-Computer -Description "Playout-Prep $($script:Stamp)" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        Write-Log "System restore point created." 'INFO'
+        $srKey  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+        $srName = 'SystemRestorePointCreationFrequency'
+        $prev   = (Get-ItemProperty -LiteralPath $srKey -Name $srName -ErrorAction SilentlyContinue).$srName
+        Set-Reg $srKey $srName 0
+        try {
+            Checkpoint-Computer -Description "Playout-Prep $($script:Stamp)" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+            Write-Log "System restore point created." 'INFO'
+        } finally {
+            if ($null -ne $prev) { Set-Reg $srKey $srName $prev }
+            else { Remove-ItemProperty -LiteralPath $srKey -Name $srName -ErrorAction SilentlyContinue }
+        }
     } catch {
         Write-Log "Restore point not created: $($_.Exception.Message)" 'WARN'
     }
@@ -255,17 +281,17 @@ function Invoke-Power {
 
     Invoke-Action "Create/activate '24-7 Playout' plan (AC+DC: no sleep/hibernate/display/disk timeouts, CPU 100%, no core parking, PCIe ASPM off, USB selective suspend off, no password on wake)" {
         $g = $null
-        $existing = powercfg.exe /list | Select-String '24-7 Playout'
+        $existing = powercfg.exe /list | Select-String '24-7 Playout' | Select-Object -First 1
         if ($existing -and ($existing.Line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')) {
             $g = $Matches[1]
         } else {
-            $out = (powercfg.exe /duplicatescheme SCHEME_MIN 2>&1 | Out-String)
+            $out = Invoke-Native powercfg.exe @('/duplicatescheme', 'SCHEME_MIN')
             if ($out -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
                 $g = $Matches[1]
             } else {
                 throw "powercfg /duplicatescheme failed: $out"
             }
-            powercfg.exe /changename $g "24-7 Playout" "Always-on media playout" | Out-Null
+            Invoke-Native powercfg.exe @('/changename', $g, '24-7 Playout', 'Always-on media playout') | Out-Null
         }
         $settings = @(
             @('SUB_SLEEP',     'STANDBYIDLE',      0),
@@ -279,14 +305,20 @@ function Invoke-Power {
             @('SUB_NONE',      'CONSOLELOCK',      0),
             @('2a737441-1930-4402-8d77-b2bebba308a3', '48e6b7a6-50f5-4782-a5d4-53bb8f07e226', 0)
         )
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         foreach ($s in $settings) {
             foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
-                powercfg.exe $mode $g $s[0] $s[1] $s[2] | Out-Null
+                & powercfg.exe $mode $g $s[0] $s[1] $s[2] 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Log "powercfg $mode $($s[0])/$($s[1]) not supported on this system (skipped)" 'WARN' }
             }
         }
-        powercfg.exe /setactive $g | Out-Null
+        $ErrorActionPreference = $eap
+        Invoke-Native powercfg.exe @('/setactive', $g) | Out-Null
+        $active = Invoke-Native powercfg.exe @('/getactivescheme')
+        if ($active -notmatch [regex]::Escape($g)) { throw "Power plan $g did not become active" }
     }
-    Invoke-Action "Disable hibernation (removes hiberfil.sys and Fast Startup)" { powercfg.exe /hibernate off | Out-Null }
+    Invoke-Action "Disable hibernation (removes hiberfil.sys and Fast Startup)" { Invoke-Native powercfg.exe @('/hibernate', 'off') | Out-Null }
     Invoke-Action "Disable Fast Startup explicitly" {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 0
     }
@@ -537,10 +569,14 @@ function Invoke-Network {
         Set-Service w32time -StartupType Automatic
         if ((Get-Service w32time).Status -ne 'Running') { Start-Service w32time }
         $peerArg = "/manualpeerlist:" + (($NtpServers | ForEach-Object { "$_,0x9" }) -join ' ')
-        w32tm.exe /config $peerArg /syncfromflags:manual /reliable:NO /update | Out-Null
+        Invoke-Native w32tm.exe @('/config', $peerArg, '/syncfromflags:manual', '/reliable:NO', '/update') | Out-Null
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' 'SpecialPollInterval' 900
         Restart-Service w32time
-        w32tm.exe /resync /force | Out-Null
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        w32tm.exe /resync /force 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Log "w32tm resync failed (peer not reachable yet?); it will sync later" 'WARN' }
+        $ErrorActionPreference = $eap
     }
 }
 
@@ -598,12 +634,13 @@ function Invoke-Watchdog {
     if (-not $AppPath) { Write-Log "-AppPath not set: skipping watchdog task." 'WARN'; return }
     if (-not (Test-Path $AppPath)) { Write-Log "AppPath not found: $AppPath -- skipping watchdog task." 'WARN'; return }
     $user = Get-TaskUserName
+    if ($RunElevated) { Write-Log "-RunElevated only elevates for administrator accounts; a standard kiosk user's task still runs unelevated." 'WARN' }
     Invoke-Action "Watchdog task 'Playout-Watchdog': launches $AppPath at logon of $user and re-launches it within 1 minute if it exits or crashes (no duplicate instances)" {
         $actionArgs = @{ Execute = $AppPath; WorkingDirectory = (Split-Path $AppPath -Parent) }
         if ($AppArguments) { $actionArgs['Argument'] = $AppArguments }
         $action  = New-ScheduledTaskAction @actionArgs
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-        $rep     = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::MaxValue)
+        $rep     = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
         $trigger.Repetition = $rep.Repetition
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
                         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -623,9 +660,18 @@ function Invoke-Resilience {
     }
     Invoke-Action "Suppress Windows Error Reporting crash dialogs (a crashed app must actually exit so the watchdog can relaunch it)" {
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'DontShowUI' 1
-        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' 'DontShowUI' 1
         Set-Reg (Get-UserPath 'Software\Microsoft\Windows\Windows Error Reporting') 'DontShowUI' 1
+    }
+    if ($AppPath) {
+        Invoke-Action "Crash dumps: keep up to 3 full dumps of $(Split-Path $AppPath -Leaf) in $($env:SystemDrive)\CrashDumps (WER LocalDumps)" {
+            $dumpDir = Join-Path $env:SystemDrive 'CrashDumps'
+            New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
+            $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\' + (Split-Path $AppPath -Leaf)
+            Set-Reg $k 'DumpFolder' $dumpDir 'ExpandString'
+            Set-Reg $k 'DumpCount' 3
+            Set-Reg $k 'DumpType' 2
+        }
     }
     Invoke-Watchdog
     if ($DailyRebootTime) {
@@ -710,6 +756,30 @@ function Show-Checklist {
 }
 
 # ---------------------------------------------------------------------------
+# 13. Verification
+# ---------------------------------------------------------------------------
+function Show-Verification {
+    Write-Host "`n== Current state ==" -ForegroundColor Cyan
+    Write-Host ("Active power plan   : " + ((powercfg.exe /getactivescheme) -join ' '))
+    $wuDrv = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
+    Write-Host "WU driver exclusion : $wuDrv (1 = on)"
+    $hib = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction SilentlyContinue).HibernateEnabled
+    Write-Host "HibernateEnabled    : $hib (0 = off)"
+    foreach ($tn in 'Playout-Watchdog', 'Playout-DailyReboot') {
+        $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+        if ($t) { Write-Host "Task $tn : $($t.State)" } else { Write-Host "Task $tn : not present" }
+    }
+    foreach ($s in 'SysMain', 'DiagTrack', 'wuauserv', 'w32time') {
+        $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+        if ($svc) { Write-Host ("Service {0,-9}   : {1} / {2}" -f $s, $svc.Status, $svc.StartType) }
+    }
+    if ($AppPath) {
+        $pn = [System.IO.Path]::GetFileNameWithoutExtension($AppPath)
+        Write-Host ("App running ($pn) : " + [bool](Get-Process -Name $pn -ErrorAction SilentlyContinue))
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
 function Invoke-All {
@@ -745,6 +815,7 @@ function Show-Menu {
     Write-Host " 10) Auto-logon"
     Write-Host " 11) Post-install checklist (NVIDIA, BIOS, validation)"
     Write-Host " 12) Show log file location"
+    Write-Host " 13) Verify current state"
     Write-Host "  0) Exit"
     Write-Host "=============================================================" -ForegroundColor Cyan
 }
@@ -768,6 +839,7 @@ do {
         '10' { if (Confirm-Step "Configure auto-logon? This stores a credential on this machine") { New-SafetyBackup; Invoke-AutoLogon } }
         '11' { Show-Checklist }
         '12' { Write-Host "Log file: $($script:LogFile)" -ForegroundColor Cyan }
+        '13' { Show-Verification }
         '0'  { Write-Log "Session ended by user." 'INFO' }
         default { Write-Host "Invalid selection." -ForegroundColor Yellow }
     }
