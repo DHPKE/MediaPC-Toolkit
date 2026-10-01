@@ -9,6 +9,20 @@ Third-party apps run normally (UAC is untouched). Anything from Windows that cou
 updates and reboots, update/remediation tasks, automatic maintenance, Defender scans, notifications, lock screen,
 SmartScreen / security-warning prompts, crash dialogs, vendor "restart apps" behaviour and more.
 
+### vvvv variant: `profiles/Prepare-PlayoutPC_vvvv.ps1`
+
+Same hardening as above, plus a **prerequisite step** for exported vvvv gamma apps. Exports that reference VL.Stride
+need the Visual C++ Redistributable and .NET on the target PC (see the gray book *Exporting Applications* page for the
+exact versions of your vvvv release). Because Windows Update, Store and feature-on-demand installs are blocked afterwards,
+the step runs **before** the update lock: it checks for the VC++ 2015-2022 x64 Redistributable and the .NET SDK/runtime
+(`-DotNetMajor 8 -DotNetKind SDK|DesktopRuntime|Runtime`) and installs what is missing via `winget`
+(`-InstallPrerequisites`, or menu 15). Menu 13 shows their state.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\profiles\Prepare-PlayoutPC_vvvv.ps1 -Unattended -InstallPrerequisites `
+    -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout -MediaPaths D:\Media
+```
+
 ### Recommended order on a fresh machine
 
 1. Install Windows, run **one final patch cycle**, reboot until nothing is pending.
