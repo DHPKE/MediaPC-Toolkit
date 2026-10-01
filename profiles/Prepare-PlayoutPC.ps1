@@ -5,13 +5,21 @@
     Prepare a FRESH Windows 10 / 11 install for 24/7, uninterrupted playout
     (digital signage, exhibitions, media servers, vvvv, any third-party player software).
 
+    Profiles (-PlayoutProfile):
+      Generic   hardening only (default)
+      vvvv      adds a prerequisite step (Visual C++ Redistributable + .NET for exported vvvv gamma
+                apps) that runs BEFORE Windows Update, Store and feature-on-demand installs are
+                blocked, and refuses to lock Windows Update while they are missing.
+                Convenience entry point: Prepare-PlayoutPC_vvvv.ps1 (must stay next to this file).
+
 .DESCRIPTION
     Principle: Windows must never update, reboot, scan, prompt, pop up or take focus while the
     show runs. Third-party applications keep running normally (UAC is not touched).
 
     Recommended order on a fresh machine
       1. Install Windows, run ONE final patch cycle, reboot until nothing is pending.
-      2. Install GPU / chipset / NIC drivers.
+      2. Install GPU / chipset / NIC drivers. vvvv profile: then the prerequisites (VC++
+         Redistributable + .NET; -InstallPrerequisites or menu 15) BEFORE updates are blocked.
       3. Run this script (start with -WhatIf), reboot.
       4. Install your player software and content; test; image the machine.
       5. For deliberate maintenance later use menu 14 (unlock updates), then menu 3 to lock again.
@@ -41,7 +49,8 @@
       9  Resilience: crash dialogs off + crash dumps, no auto-restart sign-in, BSOD auto-reboot,
          watchdog task, optional daily reboot
       10 Auto-logon (kept OUT of "Run all" because it stores a credential)
-      11 Post-install checklist, 13 Verify current state, 14 Unlock updates (maintenance window)
+      11 Post-install checklist, 13 Verify current state, 14 Unlock updates (maintenance window),
+      15 Prerequisites: VC++ Redistributable + .NET check/install (vvvv profile; runs BEFORE the update lock)
 
     -Aggressive additionally: disables the search indexer, memory compression and Memory
     Integrity/VBS. Use on dedicated, isolated playout machines only.
@@ -52,6 +61,27 @@
 
 .PARAMETER IncludeDebloat
     Include section 8 in "Run all" / -Unattended (AppX removal is not covered by the restore point).
+
+.PARAMETER PlayoutProfile
+    Generic (default) or vvvv. The vvvv profile adds the prerequisite step and the lock gate.
+
+.PARAMETER InstallPrerequisites
+    vvvv profile: install missing prerequisites via winget without asking (needs internet and winget /
+    App Installer for the account running the script).
+
+.PARAMETER LockWithoutPrerequisites
+    vvvv profile: lock Windows Update even though the prerequisites are missing (default: the lock
+    is refused and, in -Unattended mode, the run exits with code 1).
+
+.PARAMETER DotNetMajor / DotNetKind / VcRedistMinVersion
+    .NET major version (default 8), kind (SDK default, DesktopRuntime, Runtime) and the minimum
+    Visual C++ 2015-2022 x64 Redistributable version (default 14.0). Check the gray book 'Exporting
+    Applications' page for what YOUR vvvv version requires on the target PC (apps that reference
+    VL.Stride need the VC++ Redistributable and .NET on the target).
+
+.PARAMETER FirewallProfiles
+    Firewall profiles for the app's inbound allow rule (default Private, Domain and Public: new
+    networks default to Public because the discovery prompt is suppressed).
 
 .PARAMETER AllowUpdates
     Keep Windows Update in notify-only mode instead of blocking it (no guard task).
@@ -102,12 +132,22 @@
 .EXAMPLE
     .\Prepare-PlayoutPC.ps1 -Unattended -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout `
         -MediaPaths D:\Media -DailyRebootTime 04:30 -NtpServers pool.ntp.org
+
+.EXAMPLE
+    .\Prepare-PlayoutPC_vvvv.ps1 -Unattended -InstallPrerequisites -AppPath "C:\Playout\Show\Show.exe" `
+        -KioskUser playout
 #>
 param(
     [switch]$WhatIf,
+    [ValidateSet('Generic','vvvv')][string]$PlayoutProfile = 'Generic',
     [switch]$Unattended,
     [switch]$IncludeDebloat,
     [switch]$AllowUpdates,
+    [switch]$InstallPrerequisites,
+    [switch]$LockWithoutPrerequisites,
+    [version]$VcRedistMinVersion = '14.0',
+    [ValidatePattern('^\d+$')][string]$DotNetMajor = '8',
+    [ValidateSet('SDK','DesktopRuntime','Runtime')][string]$DotNetKind = 'SDK',
     [switch]$Aggressive,
     [string]$AppPath,
     [string]$AppArguments,
@@ -118,6 +158,7 @@ param(
     [ValidateSet('Leave','On','Off')][string]$HAGS = 'Leave',
     [switch]$DisableMPO,
     [switch]$SetNetworkPrivate,
+    [ValidateSet('Private','Domain','Public')][string[]]$FirewallProfiles = @('Private','Domain','Public'),
     [string[]]$NtpServers = @('time.windows.com'),
     [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')][string]$DailyRebootTime,
     [string[]]$AppsToKeep = @(),
@@ -154,11 +195,13 @@ $script:UpdateTaskPaths = @(
     '\Microsoft\Windows\InstallService\'
 )
 $script:UpdateServices = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc', 'sedsvc')
+$script:StateDir  = Join-Path $env:ProgramData 'PlayoutPrep'
+$script:StateFile = Join-Path $script:StateDir 'disabled-tasks.json'
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-function Write-Log {
+function Write-PlayoutLog {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR','ACTION','DRY')][string]$Level = 'INFO')
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
@@ -169,13 +212,13 @@ function Write-Log {
 
 function Invoke-Action {
     param([string]$Description, [scriptblock]$Action)
-    if ($WhatIf) { Write-Log "WOULD: $Description" 'DRY'; return }
+    if ($WhatIf) { Write-PlayoutLog "WOULD: $Description" 'DRY'; return }
     try {
         $ErrorActionPreference = 'Stop'   # non-terminating errors must not be logged as success
         & $Action | Out-Null
-        Write-Log $Description 'ACTION'
+        Write-PlayoutLog $Description 'ACTION'
     } catch {
-        Write-Log "FAILED: $Description -- $($_.Exception.Message)" 'ERROR'
+        Write-PlayoutLog "FAILED: $Description -- $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -225,69 +268,97 @@ function Get-TaskUserName {
     return "$env:USERDOMAIN\$env:USERNAME"
 }
 
-# Stop + disable a service. Some update services are protected by Windows: warn instead of failing;
-# the update-guard task keeps retrying.
+# Stop + disable a service. Some update services are protected by Windows. Returns $true if the
+# service is disabled afterwards; the update-guard task keeps retrying the others.
 function Disable-ServiceBestEffort {
     param([string]$Name)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return }
+    if (-not $svc) { return $true }
     Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
     try {
         Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
     } catch {
         & sc.exe config $Name start= disabled | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Service $Name is protected by Windows and could not be disabled (update guard will retry)." 'WARN'
-        }
     }
+    $after = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    return ($after.StartType -eq 'Disabled')
 }
 
+# State/guard directory: SYSTEM runs files from it, so only SYSTEM and Administrators may write there.
+function Initialize-StateDir {
+    New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
+    Invoke-Native icacls.exe @($script:StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') | Out-Null
+}
+
+function Get-DisabledTaskList {
+    if (Test-Path $script:StateFile) {
+        try { return @(Get-Content -Path $script:StateFile -Raw | ConvertFrom-Json) } catch { return @() }
+    }
+    return @()
+}
+
+function Add-DisabledTaskList {
+    param([string[]]$Names)
+    if (-not $Names -or $Names.Count -eq 0) { return }
+    Initialize-StateDir
+    $all = @(@(Get-DisabledTaskList) + $Names | Where-Object { $_ } | Select-Object -Unique)
+    ConvertTo-Json -InputObject $all | Set-Content -Path $script:StateFile -Encoding ASCII
+}
+
+# Disable every task under the given folders and remember which ones WE disabled (for menu 14).
 function Disable-TasksUnder {
     param([string[]]$Paths)
-    $done = 0; $protected = 0
+    $done = New-Object System.Collections.Generic.List[string]
+    $protected = 0
     foreach ($p in $Paths) {
         foreach ($t in @(Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue)) {
             if ($t.State -eq 'Disabled') { continue }
-            try { $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null; $done++ } catch { $protected++ }
+            try {
+                $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null
+                $done.Add(($t.TaskPath + $t.TaskName))
+            } catch {
+                $protected++
+            }
         }
     }
-    Write-Log "Disabled $done task(s) under $($Paths -join ', '); $protected protected by Windows (update guard retries)." 'INFO'
+    Add-DisabledTaskList -Names $done.ToArray()
+    Write-PlayoutLog "Disabled $($done.Count) task(s) under $($Paths -join ', '); $protected protected by Windows (update guard retries)." 'INFO'
 }
 
 # Point all per-user (HKCU) writes at the kiosk account instead of the elevated admin.
 function Initialize-UserHive {
     if (-not $KioskUser) {
-        Write-Log "No -KioskUser given: per-user (HKCU) tweaks apply to $env:USERDOMAIN\$env:USERNAME. If you elevated from a different account, pass -KioskUser." 'WARN'
+        Write-PlayoutLog "No -KioskUser given: per-user (HKCU) tweaks apply to $env:USERDOMAIN\$env:USERNAME. If you elevated from a different account, pass -KioskUser." 'WARN'
         return
     }
     try {
         $nt  = New-Object System.Security.Principal.NTAccount($KioskUser)
         $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch {
-        Write-Log "Could not resolve -KioskUser '$KioskUser': $($_.Exception.Message). Falling back to HKCU." 'WARN'
+        Write-PlayoutLog "Could not resolve -KioskUser '$KioskUser': $($_.Exception.Message). Falling back to HKCU." 'WARN'
         return
     }
     if (Test-Path "Registry::HKEY_USERS\$sid") {
         $script:UserRoot   = "Registry::HKEY_USERS\$sid"
         $script:UserRegKey = "HKU\$sid"
-        Write-Log "Per-user tweaks target $KioskUser (hive already loaded)." 'INFO'
+        Write-PlayoutLog "Per-user tweaks target $KioskUser (hive already loaded)." 'INFO'
         return
     }
     $prof = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
     if (-not $prof) {
-        Write-Log "User '$KioskUser' has no profile yet (never logged on). Log in once, then re-run. Falling back to HKCU." 'WARN'
+        Write-PlayoutLog "User '$KioskUser' has no profile yet (never logged on). Log in once, then re-run. Falling back to HKCU." 'WARN'
         return
     }
-    if ($WhatIf) { Write-Log "WOULD: load $($prof.LocalPath)\NTUSER.DAT for per-user tweaks" 'DRY'; return }
+    if ($WhatIf) { Write-PlayoutLog "WOULD: load $($prof.LocalPath)\NTUSER.DAT for per-user tweaks" 'DRY'; return }
     $hive = Join-Path $prof.LocalPath 'NTUSER.DAT'
     reg.exe load HKU\PlayoutKiosk "$hive" 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $script:UserRoot   = 'Registry::HKEY_USERS\PlayoutKiosk'
         $script:UserRegKey = 'HKU\PlayoutKiosk'
         $script:HiveLoaded = $true
-        Write-Log "Loaded hive of $KioskUser for per-user tweaks." 'INFO'
+        Write-PlayoutLog "Loaded hive of $KioskUser for per-user tweaks." 'INFO'
     } else {
-        Write-Log "Could not load hive for $KioskUser. Falling back to HKCU." 'WARN'
+        Write-PlayoutLog "Could not load hive for $KioskUser. Falling back to HKCU." 'WARN'
     }
 }
 
@@ -302,7 +373,7 @@ function Dismount-UserHive {
 function New-SafetyBackup {
     if ($script:BackupDone) { return }
     $script:BackupDone = $true
-    if ($WhatIf) { Write-Log "WOULD: create restore point and export touched registry keys" 'DRY'; return }
+    if ($WhatIf) { Write-PlayoutLog "WOULD: create restore point and export touched registry keys" 'DRY'; return }
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
         $srKey  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
@@ -311,13 +382,13 @@ function New-SafetyBackup {
         Set-Reg $srKey $srName 0
         try {
             Checkpoint-Computer -Description "Playout-Prep $($script:Stamp)" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-            Write-Log "System restore point created." 'INFO'
+            Write-PlayoutLog "System restore point created." 'INFO'
         } finally {
             if ($null -ne $prev) { Set-Reg $srKey $srName $prev }
             else { Remove-ItemProperty -LiteralPath $srKey -Name $srName -ErrorAction SilentlyContinue }
         }
     } catch {
-        Write-Log "Restore point not created: $($_.Exception.Message)" 'WARN'
+        Write-PlayoutLog "Restore point not created: $($_.Exception.Message)" 'WARN'
     }
     $dir = Join-Path $env:SystemDrive "Playout-Prep-Backup-$($script:Stamp)"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -342,14 +413,14 @@ function New-SafetyBackup {
         $file = Join-Path $dir (($k -replace '[\\: ]', '_') + '.reg')
         reg.exe export $k $file /y 2>&1 | Out-Null
     }
-    Write-Log "Registry exports saved to $dir" 'INFO'
+    Write-PlayoutLog "Registry exports saved to $dir" 'INFO'
 }
 
 # ---------------------------------------------------------------------------
 # 2. Power
 # ---------------------------------------------------------------------------
 function Invoke-Power {
-    Write-Log "== Power, sleep and throttling ==" 'INFO'
+    Write-PlayoutLog "== Power, sleep and throttling ==" 'INFO'
 
     Invoke-Action "Create/activate '24-7 Playout' plan (AC+DC: no sleep/hibernate/display/disk timeouts, CPU 100%, no core parking, PCIe ASPM off, USB selective suspend off, no password on wake)" {
         $g = $null
@@ -382,7 +453,7 @@ function Invoke-Power {
         foreach ($s in $settings) {
             foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
                 & powercfg.exe $mode $g $s[0] $s[1] $s[2] 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) { Write-Log "powercfg $mode $($s[0])/$($s[1]) not supported on this system (skipped)" 'WARN' }
+                if ($LASTEXITCODE -ne 0) { Write-PlayoutLog "powercfg $mode $($s[0])/$($s[1]) not supported on this system (skipped)" 'WARN' }
             }
         }
         $ErrorActionPreference = $eap
@@ -405,29 +476,132 @@ function Invoke-Power {
 }
 
 # ---------------------------------------------------------------------------
+# 15. vvvv prerequisites (must run BEFORE the Windows Update lock)
+# ---------------------------------------------------------------------------
+function Get-DotNetState {
+    $dotnet = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
+    if (-not (Test-Path $dotnet)) {
+        $cmd = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $dotnet = $cmd.Source } else { $dotnet = $null }
+    }
+    $state = @{ Path = $dotnet; Sdks = @(); Runtimes = @() }
+    if ($dotnet) {
+        $state.Sdks     = @(& $dotnet --list-sdks 2>$null)
+        $state.Runtimes = @(& $dotnet --list-runtimes 2>$null)
+    }
+    return $state
+}
+
+function Get-VcRedistVersion {
+    $p = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
+    $k = Get-ItemProperty -LiteralPath $p -ErrorAction SilentlyContinue
+    if (-not $k -or $k.Installed -ne 1) { return $null }
+    try { return [version](($k.Version) -replace '^v', '') } catch { Write-Verbose "VC++ version string not parsable: $($k.Version)" }
+    return [version]('{0}.{1}.{2}' -f $k.Major, $k.Minor, $k.Bld)
+}
+
+function Test-VcRedist {
+    $v = Get-VcRedistVersion
+    return ($null -ne $v -and $v -ge $VcRedistMinVersion)
+}
+
+function Test-DotNetPresent {
+    $st    = Get-DotNetState
+    $major = [regex]::Escape($DotNetMajor)
+    $sdk   = (@($st.Sdks | Where-Object { $_ -match "^$major\." }).Count -gt 0)
+    if ($DotNetKind -eq 'SDK') { return $sdk }
+    if ($sdk) { return $true }   # the SDK installs the runtimes as well
+    $pattern = "^Microsoft\.NETCore\.App $major\."
+    if ($DotNetKind -eq 'DesktopRuntime') { $pattern = "^Microsoft\.WindowsDesktop\.App $major\." }
+    return (@($st.Runtimes | Where-Object { $_ -match $pattern }).Count -gt 0)
+}
+
+function Test-PrerequisitesMet {
+    return ((Test-VcRedist) -and (Test-DotNetPresent))
+}
+
+function Invoke-Prerequisites {
+    Write-PlayoutLog "== vvvv prerequisites (VC++ Redistributable + .NET $DotNetMajor $DotNetKind) ==" 'INFO'
+    $needVc  = -not (Test-VcRedist)
+    $needNet = -not (Test-DotNetPresent)
+    if (-not $needVc -and -not $needNet) {
+        Write-PlayoutLog "VC++ 2015-2022 Redistributable (x64) and .NET $DotNetMajor $DotNetKind are already present." 'INFO'
+        return
+    }
+    if ($needVc)  { Write-PlayoutLog "Missing: Visual C++ 2015-2022 Redistributable (x64)" 'WARN' }
+    if ($needNet) { Write-PlayoutLog "Missing: .NET $DotNetMajor $DotNetKind" 'WARN' }
+
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        Write-PlayoutLog "winget (App Installer) not available for this account. Install the missing items manually from Microsoft BEFORE blocking Windows Update; the gray book 'Exporting Applications' page lists what your vvvv version needs." 'WARN'
+        return
+    }
+    if (-not ($InstallPrerequisites -or (Confirm-Step "Install the missing prerequisites via winget now (needs internet)?"))) {
+        Write-PlayoutLog "Prerequisites NOT installed. Install them before the Windows Update lock / before going live." 'WARN'
+        return
+    }
+    $items = @()
+    if ($needVc)  { $items += 'Microsoft.VCRedist.2015+.x64' }
+    if ($needNet) { $items += "Microsoft.DotNet.$DotNetKind.$DotNetMajor" }
+    foreach ($id in $items) {
+        Invoke-Action "winget install $id (silent)" {
+            Invoke-Native winget.exe @('install', '--id', $id, '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
+        }
+    }
+    if (-not $WhatIf) {
+        if (-not (Test-VcRedist))      { Write-PlayoutLog "VC++ Redistributable still not detected after install." 'WARN' }
+        if (-not (Test-DotNetPresent)) { Write-PlayoutLog ".NET $DotNetMajor $DotNetKind still not detected after install." 'WARN' }
+    }
+}
+
+function Show-PrerequisiteState {
+    $st = Get-DotNetState
+    $vc = Get-VcRedistVersion
+    $vcText = 'not installed'
+    if ($vc) { $vcText = "$vc (minimum $VcRedistMinVersion): $(Test-VcRedist)" }
+    Write-Host ("VC++ 2015-2022 x64  : " + $vcText)
+    Write-Host (".NET $DotNetMajor $DotNetKind present : " + (Test-DotNetPresent))
+    Write-Host ("dotnet SDKs         : " + ((@($st.Sdks) | ForEach-Object { ($_ -split ' ')[0] }) -join ', '))
+}
+
+# ---------------------------------------------------------------------------
 # 3. Windows Update
 # ---------------------------------------------------------------------------
 function Install-UpdateGuard {
-    $dir  = Join-Path $env:ProgramData 'PlayoutPrep'
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $file = Join-Path $dir 'Update-Guard.ps1'
-    $body = @'
+    Initialize-StateDir
+    $file      = Join-Path $script:StateDir 'Update-Guard.ps1'
+    $taskPaths = ($script:UpdateTaskPaths | ForEach-Object { "'$_'" }) -join ', '
+    $services  = ($script:UpdateServices  | ForEach-Object { "'$_'" }) -join ', '
+    $template  = @'
 $ErrorActionPreference = 'SilentlyContinue'
 # Re-apply the Windows Update lock (Windows remediation tasks may re-enable services/tasks).
 $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
 New-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -PropertyType DWord -Force | Out-Null
-foreach ($s in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc', 'sedsvc') {
+foreach ($s in __SERVICES__) {
     $svc = Get-Service -Name $s
     if ($svc) {
         if ($svc.Status -ne 'Stopped') { Stop-Service -Name $s -Force }
         if ($svc.StartType -ne 'Disabled') { Set-Service -Name $s -StartupType Disabled }
     }
 }
-foreach ($p in '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\', '\Microsoft\Windows\WaaSMedic\') {
-    Get-ScheduledTask -TaskPath $p | Where-Object { $_.State -ne 'Disabled' } | Disable-ScheduledTask | Out-Null
+$state = '__STATEFILE__'
+$names = @()
+foreach ($p in __TASKPATHS__) {
+    foreach ($t in @(Get-ScheduledTask -TaskPath $p)) {
+        if ($t.State -ne 'Disabled') {
+            $t | Disable-ScheduledTask | Out-Null
+            $names += ($t.TaskPath + $t.TaskName)
+        }
+    }
+}
+if ($names.Count -gt 0) {
+    $all = @()
+    if (Test-Path $state) { $all = @(Get-Content -Path $state -Raw | ConvertFrom-Json) }
+    $all = @($all + $names | Select-Object -Unique)
+    ConvertTo-Json -InputObject $all | Set-Content -Path $state -Encoding ASCII
 }
 '@
+    $body = $template.Replace('__SERVICES__', $services).Replace('__TASKPATHS__', $taskPaths).Replace('__STATEFILE__', $script:StateFile)
     Set-Content -Path $file -Value $body -Encoding ASCII
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $file)
     $trigger   = New-ScheduledTaskTrigger -AtStartup
@@ -439,10 +613,46 @@ foreach ($p in '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\Win
     Register-ScheduledTask -TaskName 'Playout-UpdateGuard' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
+# Verify the lock: core services (wuauserv, UsoSvc) and the policy are ERRORs if not applied;
+# services Windows protects are WARNs (the guard task keeps retrying).
+function Test-UpdateLock {
+    $core = @('wuauserv', 'UsoSvc')
+    $ok = $true
+    foreach ($s in $script:UpdateServices) {
+        $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+        if (-not $svc) { continue }
+        if ($svc.StartType -ne 'Disabled') {
+            if ($core -contains $s) {
+                Write-PlayoutLog "Update service $s is NOT disabled (start type $($svc.StartType))." 'ERROR'
+                $ok = $false
+            } else {
+                Write-PlayoutLog "Update service $s is still $($svc.StartType) (protected by Windows; the update guard keeps retrying)." 'WARN'
+            }
+        }
+    }
+    $noAu = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue).NoAutoUpdate
+    if ($noAu -ne 1) {
+        Write-PlayoutLog "NoAutoUpdate policy is not set." 'ERROR'
+        $ok = $false
+    }
+    return $ok
+}
+
 function Invoke-Updates {
     $mode = 'BLOCKED'
     if ($AllowUpdates) { $mode = 'NOTIFY-ONLY (-AllowUpdates)' }
-    Write-Log "== Windows Update: $mode ==" 'INFO'
+    Write-PlayoutLog "== Windows Update: $mode ==" 'INFO'
+
+    # vvvv profile: never lock Windows Update while the prerequisites are missing (installs would fail afterwards).
+    if ($PlayoutProfile -eq 'vvvv' -and -not $AllowUpdates -and -not $LockWithoutPrerequisites) {
+        if (-not (Test-PrerequisitesMet)) {
+            $lvl = 'ERROR'
+            if ($WhatIf) { $lvl = 'DRY' }
+            Write-PlayoutLog "Windows Update lock SKIPPED: vvvv prerequisites (VC++ Redistributable >= $VcRedistMinVersion / .NET $DotNetMajor $DotNetKind) are missing. Install them (menu 15 or -InstallPrerequisites), then run menu 3 - or pass -LockWithoutPrerequisites." $lvl
+            return
+        }
+    }
+
     $wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $au = "$wu\AU"
 
@@ -493,19 +703,20 @@ function Invoke-Updates {
         Set-Reg $wu 'SetDisableUXWUAccess' 1
     }
     Invoke-Action "BLOCK: stop and disable Windows Update services ($($script:UpdateServices -join ', '))" {
-        foreach ($s in $script:UpdateServices) { Disable-ServiceBestEffort $s }
+        foreach ($s in $script:UpdateServices) { [void](Disable-ServiceBestEffort $s) }
     }
     Invoke-Action "BLOCK: disable update / orchestrator / remediation scheduled tasks" {
         Disable-TasksUnder $script:UpdateTaskPaths
     }
-    Invoke-Action "BLOCK: install SYSTEM task 'Playout-UpdateGuard' (at startup + every 30 min, hidden) that re-applies the block if Windows re-enables anything" {
+    Invoke-Action "BLOCK: install SYSTEM task 'Playout-UpdateGuard' (at startup + every 30 min, hidden; files in a SYSTEM/Administrators-only folder) that re-applies the block if Windows re-enables anything" {
         Install-UpdateGuard
     }
+    if (-not $WhatIf) { [void](Test-UpdateLock) }
 }
 
 # Menu 14: deliberately open a maintenance window. Re-run section 3 afterwards to lock again.
 function Invoke-UpdateUnlock {
-    Write-Log "== Unlock Windows Update for a maintenance window ==" 'INFO'
+    Write-PlayoutLog "== Unlock Windows Update for a maintenance window ==" 'INFO'
     Invoke-Action "Remove update guard task" {
         Unregister-ScheduledTask -TaskName 'Playout-UpdateGuard' -Confirm:$false -ErrorAction SilentlyContinue
     }
@@ -514,26 +725,29 @@ function Invoke-UpdateUnlock {
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'AUOptions' 2
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'SetDisableUXWUAccess' 0
     }
-    Invoke-Action "Services back to Manual (wuauserv, UsoSvc, DoSvc, WaaSMedicSvc where permitted) and update tasks re-enabled" {
+    Invoke-Action "Update services back to Manual (where permitted) and re-enable ONLY the tasks this script disabled" {
         foreach ($s in $script:UpdateServices) {
             if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
-                try { Set-Service -Name $s -StartupType Manual -ErrorAction Stop } catch { Write-Log "Could not change $s (protected)." 'WARN' }
+                try { Set-Service -Name $s -StartupType Manual -ErrorAction Stop } catch { Write-PlayoutLog "Could not change $s (protected)." 'WARN' }
             }
         }
-        foreach ($p in $script:UpdateTaskPaths) {
-            foreach ($t in @(Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue)) {
-                try { $t | Enable-ScheduledTask -ErrorAction Stop | Out-Null } catch { }
+        foreach ($full in @(Get-DisabledTaskList)) {
+            if ($full -match '^(.*\\)([^\\]+)$') {
+                $t = Get-ScheduledTask -TaskPath $Matches[1] -TaskName $Matches[2] -ErrorAction SilentlyContinue
+                if ($t) {
+                    try { $t | Enable-ScheduledTask -ErrorAction Stop | Out-Null } catch { Write-PlayoutLog "Could not re-enable task $full (protected)." 'WARN' }
+                }
             }
         }
     }
-    Write-Log "Windows Update is open. Patch, reboot, then run menu 3 to lock it again BEFORE going live." 'WARN'
+    Write-PlayoutLog "Windows Update is open. Patch, reboot, then run menu 3 to lock it again BEFORE going live." 'WARN'
 }
 
 # ---------------------------------------------------------------------------
 # 4. Graphics
 # ---------------------------------------------------------------------------
 function Invoke-Graphics {
-    Write-Log "== Graphics / GPU-related OS settings ==" 'INFO'
+    Write-PlayoutLog "== Graphics / GPU-related OS settings ==" 'INFO'
 
     Invoke-Action "Disable Game DVR / Game Bar capture hooks" {
         Set-Reg (Get-UserPath 'System\GameConfigStore') 'GameDVR_Enabled' 0
@@ -552,7 +766,7 @@ function Invoke-Graphics {
                 Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' $v
             }
         } else {
-            Write-Log "HAGS needs Windows 10 2004 or newer: skipped." 'WARN'
+            Write-PlayoutLog "HAGS needs Windows 10 2004 or newer: skipped." 'WARN'
         }
     }
     if ($DisableMPO) {
@@ -566,7 +780,7 @@ function Invoke-Graphics {
             Set-Reg (Get-UserPath 'Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers') $AppPath '~ DISABLEDXMAXIMIZEDWINDOWEDMODE' 'String'
         }
     } else {
-        Write-Log "-AppPath not set: skipping per-app GPU preference / fullscreen-optimization flags." 'WARN'
+        Write-PlayoutLog "-AppPath not set: skipping per-app GPU preference / fullscreen-optimization flags." 'WARN'
     }
 }
 
@@ -574,7 +788,7 @@ function Invoke-Graphics {
 # 5. Distractions
 # ---------------------------------------------------------------------------
 function Invoke-Distractions {
-    Write-Log "== Focus-stealing popups, notifications, lock screen, prompts ==" 'INFO'
+    Write-PlayoutLog "== Focus-stealing popups, notifications, lock screen, prompts ==" 'INFO'
 
     Invoke-Action "Disable Sticky/Filter/Toggle Keys hotkeys and popups (kiosk user + logon screen)" {
         foreach ($root in @($script:UserRoot, 'Registry::HKEY_USERS\.DEFAULT')) {
@@ -608,7 +822,7 @@ function Invoke-Distractions {
     if ($script:IsWin11) {
         $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
         if ($sac -eq 1 -or $sac -eq 2) {
-            Write-Log "Smart App Control is ON/evaluating: it can block unsigned third-party apps. Turn it off in Windows Security > App & browser control (it cannot be re-enabled without reinstalling)." 'WARN'
+            Write-PlayoutLog "Smart App Control is ON/evaluating: it can block unsigned third-party apps. Turn it off in Windows Security > App & browser control (it cannot be re-enabled without reinstalling)." 'WARN'
         }
     }
     Invoke-Action "Suppress the 'allow your PC to be discoverable on this network?' prompt" {
@@ -646,7 +860,7 @@ function Invoke-Distractions {
 # 6. Background services, tasks, Defender, Edge
 # ---------------------------------------------------------------------------
 function Invoke-Background {
-    Write-Log "== Background tasks, services, maintenance, Defender, Edge ==" 'INFO'
+    Write-PlayoutLog "== Background tasks, services, maintenance, Defender, Edge ==" 'INFO'
 
     Invoke-Action "Turn off Automatic Maintenance" {
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
@@ -675,11 +889,14 @@ function Invoke-Background {
         Invoke-Action "Disable scheduled task $t" {
             if ($t -match '^(.*\\)([^\\]+)$') {
                 $task = Get-ScheduledTask -TaskPath $Matches[1] -TaskName $Matches[2] -ErrorAction SilentlyContinue
-                if ($task) { $task | Disable-ScheduledTask | Out-Null }
+                if ($task) {
+                    try { $task | Disable-ScheduledTask -ErrorAction Stop | Out-Null }
+                    catch { Write-PlayoutLog "Could not disable task $t (protected by Windows): $($_.Exception.Message)" 'WARN' }
+                }
             }
         }
     }
-    Write-Log "Left untouched on purpose: ScheduledDefrag (it also performs SSD TRIM/retrim; runs weekly when idle)." 'INFO'
+    Write-PlayoutLog "Left untouched on purpose: ScheduledDefrag (it also performs SSD TRIM/retrim; runs weekly when idle)." 'INFO'
 
     $svcs = @('SysMain', 'DiagTrack', 'dmwappushservice', 'MapsBroker', 'RetailDemo')
     if ($Aggressive) { $svcs += 'WSearch' }
@@ -717,7 +934,7 @@ function Invoke-Background {
             if ($AppPath) { Add-MpPreference -ExclusionProcess (Split-Path $AppPath -Leaf) -ErrorAction Stop }
         }
     } else {
-        Write-Log "No -MediaPaths/-AppPath: no Defender exclusions added." 'INFO'
+        Write-PlayoutLog "No -MediaPaths/-AppPath: no Defender exclusions added." 'INFO'
     }
 
     if ($Aggressive) {
@@ -735,7 +952,7 @@ function Invoke-Background {
 # 7. Network and time
 # ---------------------------------------------------------------------------
 function Invoke-Network {
-    Write-Log "== Network and time ==" 'INFO'
+    Write-PlayoutLog "== Network and time ==" 'INFO'
 
     Invoke-Action "Disable 'allow the computer to turn off this device' on physical NICs (restart the adapter or reboot to apply)" {
         $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
@@ -759,11 +976,16 @@ function Invoke-Network {
         }
     }
     if ($AppPath) {
-        Invoke-Action "Firewall: allow inbound for $AppPath on Private+Domain profiles (OSC/Art-Net/sACN/NDI...)" {
+        Invoke-Action "Firewall: allow inbound for $AppPath on profiles $($FirewallProfiles -join '+') (OSC/Art-Net/sACN/NDI...)" {
             $n = "Playout: $(Split-Path $AppPath -Leaf)"
-            if (-not (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)) {
-                New-NetFirewallRule -DisplayName $n -Direction Inbound -Program $AppPath -Action Allow -Profile Private, Domain | Out-Null
+            if (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue) {
+                Set-NetFirewallRule -DisplayName $n -Program $AppPath -Profile $FirewallProfiles
+            } else {
+                New-NetFirewallRule -DisplayName $n -Direction Inbound -Program $AppPath -Action Allow -Profile $FirewallProfiles | Out-Null
             }
+        }
+        if ($FirewallProfiles -notcontains 'Public') {
+            Write-PlayoutLog "Firewall rule excludes the Public profile: networks Windows classifies as Public (new networks default to Public because the discovery prompt is suppressed) keep inbound traffic to the app blocked. Use -SetNetworkPrivate or include Public." 'WARN'
         }
     }
     Invoke-Action "Windows Time: automatic start, NTP peers $($NtpServers -join ', '), 15 min poll, resync" {
@@ -776,7 +998,7 @@ function Invoke-Network {
         $eap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         w32tm.exe /resync /force 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Log "w32tm resync failed (peer not reachable yet?); it will sync later" 'WARN' }
+        if ($LASTEXITCODE -ne 0) { Write-PlayoutLog "w32tm resync failed (peer not reachable yet?); it will sync later" 'WARN' }
         $ErrorActionPreference = $eap
     }
 }
@@ -785,7 +1007,7 @@ function Invoke-Network {
 # 8. Debloat (conservative)
 # ---------------------------------------------------------------------------
 function Invoke-Debloat {
-    Write-Log "== Debloat (AppX removal is NOT undone by the restore point) ==" 'INFO'
+    Write-PlayoutLog "== Debloat (AppX removal is NOT undone by the restore point) ==" 'INFO'
 
     $protect = @('Microsoft.DesktopAppInstaller', 'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp',
                  'Microsoft.WindowsTerminal', 'Microsoft.WindowsNotepad', 'Microsoft.Paint',
@@ -806,7 +1028,7 @@ function Invoke-Debloat {
     if (-not $WhatIf) { $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue) }
 
     foreach ($name in $remove) {
-        if ($protect -contains $name) { Write-Log "Keeping $name (protected/kept)" 'INFO'; continue }
+        if ($protect -contains $name) { Write-PlayoutLog "Keeping $name (protected/kept)" 'INFO'; continue }
         Invoke-Action "Remove AppX $name" {
             Get-AppxPackage -AllUsers -Name $name -ErrorAction SilentlyContinue |
                 Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
@@ -834,10 +1056,10 @@ function Invoke-Debloat {
 # 9. Resilience
 # ---------------------------------------------------------------------------
 function Invoke-Watchdog {
-    if (-not $AppPath) { Write-Log "-AppPath not set: skipping watchdog task." 'WARN'; return }
-    if (-not (Test-Path $AppPath)) { Write-Log "AppPath not found: $AppPath -- skipping watchdog task." 'WARN'; return }
+    if (-not $AppPath) { Write-PlayoutLog "-AppPath not set: skipping watchdog task." 'WARN'; return }
+    if (-not (Test-Path $AppPath)) { Write-PlayoutLog "AppPath not found: $AppPath -- skipping watchdog task." 'WARN'; return }
     $user = Get-TaskUserName
-    if ($RunElevated) { Write-Log "-RunElevated only elevates for administrator accounts; a standard kiosk user's task still runs unelevated." 'WARN' }
+    if ($RunElevated) { Write-PlayoutLog "-RunElevated only elevates for administrator accounts; a standard kiosk user's task still runs unelevated." 'WARN' }
     Invoke-Action "Watchdog task 'Playout-Watchdog': launches $AppPath at logon of $user and re-launches it within 1 minute if it exits or crashes (no duplicate instances)" {
         $actionArgs = @{ Execute = $AppPath; WorkingDirectory = (Split-Path $AppPath -Parent) }
         if ($AppArguments) { $actionArgs['Argument'] = $AppArguments }
@@ -856,7 +1078,7 @@ function Invoke-Watchdog {
 }
 
 function Invoke-Resilience {
-    Write-Log "== Resilience ==" 'INFO'
+    Write-PlayoutLog "== Resilience ==" 'INFO'
     Invoke-Action "Crash handling: auto-reboot after BSOD, small memory dump" {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'AutoReboot' 1
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'CrashDumpEnabled' 3
@@ -890,9 +1112,16 @@ function Invoke-Resilience {
 # ---------------------------------------------------------------------------
 # 10. Auto-logon (not part of "Run all")
 # ---------------------------------------------------------------------------
+function Test-AutoLogonConfigured {
+    param([string]$User)
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+    return ($wl.AutoAdminLogon -eq '1' -and $wl.DefaultUserName -eq $User)
+}
+
+# NOTE: do not route the credential through Invoke-Native: its error text includes the arguments.
 function Invoke-AutoLogon {
-    Write-Log "== Auto-logon ==" 'INFO'
-    if ($WhatIf) { Write-Log "WOULD: configure auto-logon using method '$AutoLogonMethod'" 'DRY'; return }
+    Write-PlayoutLog "== Auto-logon ==" 'INFO'
+    if ($WhatIf) { Write-PlayoutLog "WOULD: configure auto-logon using method '$AutoLogonMethod'" 'DRY'; return }
 
     $user = $AutoLogonUserName
     if (-not $user) { $user = Read-Host "Auto-logon user name (use a dedicated low-privilege account)" }
@@ -907,18 +1136,24 @@ function Invoke-AutoLogon {
             if (-not $AutologonExePath -or -not (Test-Path $AutologonExePath)) {
                 throw "-AutologonExePath must point to a downloaded Autologon64.exe (or use -AutoLogonMethod Registry)"
             }
-            & $AutologonExePath $user $dom $plain /accepteula | Out-Null
-            Write-Log "Auto-logon configured for $dom\$user via Sysinternals Autologon (encrypted LSA secret)." 'ACTION'
+            if ($plain.Contains('"')) {
+                throw "The password contains a double quote, which cannot be passed safely to Autologon; use -AutoLogonMethod Registry or configure auto-logon manually."
+            }
+            $argLine = '"{0}" "{1}" "{2}" /accepteula' -f $user, $dom, $plain
+            $proc = Start-Process -FilePath $AutologonExePath -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+            if (-not (Test-AutoLogonConfigured $user)) { throw "Autologon did not configure Winlogon (exit code $($proc.ExitCode))." }
+            Write-PlayoutLog "Auto-logon configured and verified for $dom\$user via Sysinternals Autologon (encrypted LSA secret)." 'ACTION'
         } else {
             $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
             Set-Reg $wl 'AutoAdminLogon'    '1'   'String'
             Set-Reg $wl 'DefaultUserName'   $user 'String'
             Set-Reg $wl 'DefaultDomainName' $dom  'String'
             Set-Reg $wl 'DefaultPassword'   $plain 'String'
-            Write-Log "Auto-logon configured for $dom\$user via Winlogon registry (password stored in PLAINTEXT)." 'ACTION'
+            if (-not (Test-AutoLogonConfigured $user)) { throw "Winlogon values could not be read back." }
+            Write-PlayoutLog "Auto-logon configured and verified for $dom\$user via Winlogon registry (password stored in PLAINTEXT)." 'ACTION'
         }
     } catch {
-        Write-Log "FAILED: auto-logon -- $($_.Exception.Message)" 'ERROR'
+        Write-PlayoutLog "FAILED: auto-logon -- $($_.Exception.Message)" 'ERROR'
     } finally {
         $plain = $null
     }
@@ -934,7 +1169,7 @@ function Show-Checklist {
  -----------------------
  Order
    1. Install Windows, run ONE final patch cycle, reboot until nothing is pending.
-   2. Install GPU / chipset / NIC drivers.
+   2. Install GPU / chipset / NIC drivers (vvvv profile: then the prerequisites, menu 15, BEFORE the update lock).
    3. Run this script (-WhatIf first), reboot.
    4. Install player software and content, test, image the machine.
    5. Maintenance later: menu 14 (unlock updates) -> patch -> reboot -> menu 3 (lock again).
@@ -972,6 +1207,18 @@ function Show-Checklist {
    * Soak test 24-48 h; watch `nvidia-smi dmon` and the Windows Reliability Monitor.
 
 '@ -ForegroundColor Cyan
+    if ($PlayoutProfile -eq 'vvvv') {
+        Write-Host @'
+ vvvv profile
+   * Run the EXPORTED app on playout machines, not the editor, and test it as the kiosk user on the
+     final output layout.
+   * Exports that reference VL.Stride need the VC++ Redistributable and .NET on the target PC; check the
+     gray book 'Exporting Applications' page for your vvvv version (menu 15 checks/installs).
+   * Editor packages live per user under %LOCALAPPDATA%\vvvv\gamma\nugets.
+   * Set display scaling to 100% on the playout displays and test (DPI behaviour not verified).
+
+'@ -ForegroundColor Cyan
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1246,9 @@ function Show-Verification {
         $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
         Write-Host "Smart App Control   : $sac (0 = off, 1 = on, 2 = evaluation)"
     }
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+    Write-Host "Auto-logon          : AutoAdminLogon=$($wl.AutoAdminLogon) user=$($wl.DefaultUserName)"
+    if ($PlayoutProfile -eq 'vvvv') { Show-PrerequisiteState }
     if ($AppPath) {
         $pn = [System.IO.Path]::GetFileNameWithoutExtension($AppPath)
         Write-Host ("App running ($pn) : " + [bool](Get-Process -Name $pn -ErrorAction SilentlyContinue))
@@ -1011,6 +1261,7 @@ function Show-Verification {
 function Invoke-All {
     New-SafetyBackup
     Invoke-Power
+    if ($PlayoutProfile -eq 'vvvv') { Invoke-Prerequisites }
     Invoke-Updates
     Invoke-Graphics
     Invoke-Distractions
@@ -1018,13 +1269,14 @@ function Invoke-All {
     Invoke-Network
     if ($IncludeDebloat -or (Confirm-Step "Also run debloat (AppX removal, OneDrive)? This is NOT covered by the restore point")) { Invoke-Debloat }
     Invoke-Resilience
-    Write-Log "All sections complete. Auto-logon (10) is separate. Reboot before going live." 'INFO'
+    Write-PlayoutLog "All sections complete. Auto-logon (10) is separate. Reboot before going live." 'INFO'
 }
 
 function Show-Menu {
     Clear-Host
     Write-Host "=============================================================" -ForegroundColor Cyan
     Write-Host " Uninterrupted playout prep - Windows 10/11 ($($script:OsLabel))" -ForegroundColor Cyan
+    Write-Host " Profile: $PlayoutProfile"
     if ($WhatIf)        { Write-Host " Mode: DRY RUN (-WhatIf) - nothing will change" -ForegroundColor Yellow }
     if ($AllowUpdates)  { Write-Host " Mode: updates NOTIFY-ONLY (-AllowUpdates)" -ForegroundColor Yellow }
     if ($Aggressive)    { Write-Host " Mode: AGGRESSIVE - dedicated/isolated machines only" -ForegroundColor Yellow }
@@ -1044,13 +1296,14 @@ function Show-Menu {
     Write-Host " 12) Show log file location"
     Write-Host " 13) Verify current state"
     Write-Host " 14) UNLOCK Windows Update for a maintenance window"
+    Write-Host " 15) Prerequisites: VC++ / .NET check + winget install (vvvv profile)"
     Write-Host "  0) Exit"
     Write-Host "=============================================================" -ForegroundColor Cyan
 }
 
-Write-Log "Session start. $($script:OsLabel). Log: $($script:LogFile)" 'INFO'
+Write-PlayoutLog "Session start. $($script:OsLabel). Log: $($script:LogFile)" 'INFO'
 if ($script:OsInfo.Caption -match 'Home') {
-    Write-Log "Windows Home detected: many policy-based settings are ignored on Home. Use Pro/Enterprise/LTSC for a playout machine." 'WARN'
+    Write-PlayoutLog "Windows Home detected: many policy-based settings are ignored on Home. Use Pro/Enterprise/LTSC for a playout machine." 'WARN'
 }
 Initialize-UserHive
 
@@ -1059,7 +1312,7 @@ if ($Unattended) {
     Invoke-All
     if ($AutoLogonUserName -and $AutoLogonPassword) { Invoke-AutoLogon }
     Show-Verification
-    Write-Log "Unattended run finished with $($script:ErrorCount) error(s). Reboot before going live." 'INFO'
+    Write-PlayoutLog "Unattended run finished with $($script:ErrorCount) error(s). Reboot before going live." 'INFO'
     Dismount-UserHive
     if ($script:ErrorCount -gt 0) { exit 1 }
     exit 0
@@ -1083,7 +1336,8 @@ do {
         '12' { Write-Host "Log file: $($script:LogFile)" -ForegroundColor Cyan }
         '13' { Show-Verification }
         '14' { New-SafetyBackup; Invoke-UpdateUnlock }
-        '0'  { Write-Log "Session ended by user." 'INFO' }
+        '15' { Invoke-Prerequisites }
+        '0'  { Write-PlayoutLog "Session ended by user." 'INFO' }
         default { Write-Host "Invalid selection." -ForegroundColor Yellow }
     }
     if ($choice -ne '0') { Read-Host "Press Enter to return to the menu" | Out-Null }
