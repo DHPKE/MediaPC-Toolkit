@@ -2,56 +2,79 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Interactive Windows 11 prep for 24/7 media playout with vvvv (gamma) on
-    NVIDIA RTX A2000 / T1000 workstation GPUs.
+    Prepare a FRESH Windows 10 / 11 install for 24/7, uninterrupted playout
+    (digital signage, exhibitions, media servers, vvvv, any third-party player software).
 
 .DESCRIPTION
-    Menu-driven, reversible where possible:
-      * -WhatIf dry run (nothing is changed, everything is logged)
+    Principle: Windows must never update, reboot, scan, prompt, pop up or take focus while the
+    show runs. Third-party applications keep running normally (UAC is not touched).
+
+    Recommended order on a fresh machine
+      1. Install Windows, run ONE final patch cycle, reboot until nothing is pending.
+      2. Install GPU / chipset / NIC drivers.
+      3. Run this script (start with -WhatIf), reboot.
+      4. Install your player software and content; test; image the machine.
+      5. For deliberate maintenance later use menu 14 (unlock updates), then menu 3 to lock again.
+
+    Menu-driven or fully unattended (-Unattended). Reversible where possible:
+      * -WhatIf dry run (nothing is changed except the log file)
       * System Restore point + .reg exports of touched keys before the first change
-      * Every action is logged to a timestamped file on the system drive
+      * Every action is logged; failures are logged as failures (exit code 1 when unattended)
       * Does NOT touch UAC, does NOT disable the firewall, does NOT delete user files
         (AppX removal in section 8 does remove those apps' own data)
 
     Sections
-      2  Power: dedicated "24-7 Playout" plan, no sleep/hibernate/Fast Startup, no core
-         parking, PCIe ASPM + USB selective suspend off, power throttling off, timer resolution
-      3  Windows Update: no driver updates (protects the NVIDIA driver), deferral, no auto-reboot
+      2  Power: dedicated "24-7 Playout" plan, no sleep/hibernate/Fast Startup, no core parking,
+         PCIe ASPM + USB selective suspend off, power throttling off, timer resolution (Win11)
+      3  Windows Update: BLOCKED (policies, services, update/remediation tasks, upgrade offers,
+         no auto-reboot, no driver updates) plus a SYSTEM "update guard" task that re-applies
+         the block if Windows' remediation re-enables anything. -AllowUpdates = notify-only instead
       4  Graphics: Game DVR off, swap-chain upgrade off, per-app GPU + fullscreen-opt flags,
          optional HAGS / MPO control
-      5  Distractions: accessibility hotkeys, toasts, lock screen, screensaver, AutoPlay, ads
-      6  Background: telemetry tasks/services, Defender exclusions for media paths
+      5  Distractions: hotkeys, toasts, lock screen, screensaver, AutoPlay, ads, SmartScreen /
+         Mark-of-the-Web prompts, network-discovery prompt, restart-app restore
+      6  Background: telemetry/maintenance tasks and services, automatic maintenance off, Edge
+         updater/background mode off, Defender scans off (real-time protection stays on) and
+         exclusions for media paths
       7  Network/time: NIC power saving off, firewall rule for the app, NTP
       8  Debloat: conservative AppX removal, OneDrive, telemetry policy
-      9  Resilience: crash dialogs off, BSOD auto-reboot, watchdog task, optional daily reboot
+      9  Resilience: crash dialogs off + crash dumps, no auto-restart sign-in, BSOD auto-reboot,
+         watchdog task, optional daily reboot
       10 Auto-logon (kept OUT of "Run all" because it stores a credential)
-      11 Post-install checklist (NVIDIA driver/control panel, BIOS)
-      13 Verify: show the current power plan, task, service and policy state
+      11 Post-install checklist, 13 Verify current state, 14 Unlock updates (maintenance window)
 
-    -Aggressive additionally: disables update services, the search indexer, Defender's
-    scheduled scan, memory compression, and Memory Integrity/VBS. Use on dedicated,
-    isolated playout machines only.
+    -Aggressive additionally: disables the search indexer, memory compression and Memory
+    Integrity/VBS. Use on dedicated, isolated playout machines only.
+
+.PARAMETER Unattended
+    No prompts: back up, run all sections, verify, exit. Debloat only with -IncludeDebloat;
+    auto-logon only if -AutoLogonUserName and -AutoLogonPassword are supplied.
+
+.PARAMETER IncludeDebloat
+    Include section 8 in "Run all" / -Unattended (AppX removal is not covered by the restore point).
+
+.PARAMETER AllowUpdates
+    Keep Windows Update in notify-only mode instead of blocking it (no guard task).
 
 .PARAMETER AppPath
-    Full path to the vvvv export (.exe) or vvvv.exe itself. Enables the watchdog task,
-    firewall rule, Defender process exclusion and per-app GPU settings.
+    Full path to the player (.exe). Enables the watchdog task, firewall rule, Defender process
+    exclusion, per-app GPU settings and crash dumps.
 
 .PARAMETER AppArguments
     Command-line arguments passed to the app by the watchdog task.
 
 .PARAMETER KioskUser
-    Account that runs the playout app (e.g. "playout"). Per-user (HKCU) settings and the
-    watchdog task are applied to THIS account instead of whoever is running the script.
-    Important if you elevate from a standard user with separate admin credentials.
+    Account that runs the player (e.g. "playout"). Per-user (HKCU) settings and the watchdog task
+    are applied to THIS account instead of whoever is running the script.
 
 .PARAMETER RunElevated
-    Watchdog task runs the app with highest privileges (only if the app really needs it).
+    Watchdog task runs the app with highest privileges (only elevates for administrator accounts).
 
 .PARAMETER MediaPaths
     Folders excluded from Defender real-time scanning (media libraries, cache).
 
 .PARAMETER TargetRelease
-    Pin the Windows 11 feature release, e.g. '24H2'. Empty = don't pin.
+    Pin the feature release, e.g. '24H2' (Win11) or '22H2' (Win10). Empty = don't pin.
 
 .PARAMETER HAGS
     Hardware-accelerated GPU scheduling: Leave (default), On, Off. Reboot required.
@@ -69,20 +92,22 @@
     Extra AppX package names that debloat must not remove.
 
 .PARAMETER AutoLogonUserName / AutoLogonDomain / AutoLogonPassword / AutoLogonMethod / AutologonExePath
-    Section 10. Default is 'Sysinternals'. 'Registry' stores the password in PLAINTEXT under Winlogon.
-    'Sysinternals' uses Microsoft's Autologon tool (encrypted LSA secret); supply the path to
-    a copy of Autologon64.exe you downloaded yourself. The password is passed on its command
-    line for a moment, so run it on a trusted console.
+    Section 10. Default method is 'Sysinternals' (Microsoft's Autologon tool, encrypted LSA secret;
+    supply the path to a copy you downloaded yourself). 'Registry' stores the password in PLAINTEXT
+    under Winlogon. The password is passed on a command line for a moment: use a trusted console.
 
 .EXAMPLE
-    .\Playout-vvvv-NVIDIA-Win11.ps1 -WhatIf -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout
+    .\Prepare-PlayoutPC.ps1 -WhatIf -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout
 
 .EXAMPLE
-    .\Playout-vvvv-NVIDIA-Win11.ps1 -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout `
-        -MediaPaths D:\Media -TargetRelease 24H2 -DailyRebootTime 04:30 -HAGS Leave
+    .\Prepare-PlayoutPC.ps1 -Unattended -AppPath "C:\Playout\Show\Show.exe" -KioskUser playout `
+        -MediaPaths D:\Media -DailyRebootTime 04:30 -NtpServers pool.ntp.org
 #>
 param(
     [switch]$WhatIf,
+    [switch]$Unattended,
+    [switch]$IncludeDebloat,
+    [switch]$AllowUpdates,
     [switch]$Aggressive,
     [string]$AppPath,
     [string]$AppArguments,
@@ -115,12 +140,27 @@ $script:BackupDone = $false
 $script:UserRoot   = 'HKCU:'
 $script:UserRegKey = 'HKCU'
 $script:HiveLoaded = $false
+$script:ErrorCount = 0
+
+$script:OsInfo  = Get-CimInstance Win32_OperatingSystem
+$script:Build   = [int]$script:OsInfo.BuildNumber
+$script:IsWin11 = ($script:Build -ge 22000)
+$script:OsLabel = "$($script:OsInfo.Caption) (build $($script:Build))"
+
+$script:UpdateTaskPaths = @(
+    '\Microsoft\Windows\UpdateOrchestrator\',
+    '\Microsoft\Windows\WindowsUpdate\',
+    '\Microsoft\Windows\WaaSMedic\',
+    '\Microsoft\Windows\InstallService\'
+)
+$script:UpdateServices = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc', 'sedsvc')
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR','ACTION','DRY')][string]$Level = 'INFO')
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     $color = switch ($Level) { 'WARN' {'Yellow'} 'ERROR' {'Red'} 'ACTION' {'Green'} 'DRY' {'DarkYellow'} default {'Gray'} }
     Write-Host $line -ForegroundColor $color
@@ -168,6 +208,7 @@ function Get-UserPath {
 
 function Confirm-Step {
     param([string]$Prompt)
+    if ($Unattended) { return $false }
     $a = Read-Host "$Prompt [y/N]"
     return ($a -match '^(y|yes|j|ja)$')
 }
@@ -182,6 +223,35 @@ function Get-TaskUserName {
         return "$env:COMPUTERNAME\$AutoLogonUserName"
     }
     return "$env:USERDOMAIN\$env:USERNAME"
+}
+
+# Stop + disable a service. Some update services are protected by Windows: warn instead of failing;
+# the update-guard task keeps retrying.
+function Disable-ServiceBestEffort {
+    param([string]$Name)
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return }
+    Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    try {
+        Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
+    } catch {
+        & sc.exe config $Name start= disabled | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Service $Name is protected by Windows and could not be disabled (update guard will retry)." 'WARN'
+        }
+    }
+}
+
+function Disable-TasksUnder {
+    param([string[]]$Paths)
+    $done = 0; $protected = 0
+    foreach ($p in $Paths) {
+        foreach ($t in @(Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue)) {
+            if ($t.State -eq 'Disabled') { continue }
+            try { $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null; $done++ } catch { $protected++ }
+        }
+    }
+    Write-Log "Disabled $done task(s) under $($Paths -join ', '); $protected protected by Windows (update guard retries)." 'INFO'
 }
 
 # Point all per-user (HKCU) writes at the kiosk account instead of the elevated admin.
@@ -261,6 +331,8 @@ function New-SafetyBackup {
         'HKLM\SOFTWARE\Microsoft\Windows\Dwm',
         'HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting',
         'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',
+        'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule',
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
         "$ur\Software\Policies",
         "$ur\Software\Microsoft\DirectX",
         "$ur\Control Panel\Accessibility",
@@ -289,7 +361,7 @@ function Invoke-Power {
             if ($out -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
                 $g = $Matches[1]
             } else {
-                throw "powercfg /duplicatescheme failed: $out"
+                throw "powercfg /duplicatescheme returned no GUID: $out"
             }
             Invoke-Native powercfg.exe @('/changename', $g, '24-7 Playout', 'Always-on media playout') | Out-Null
         }
@@ -325,20 +397,56 @@ function Invoke-Power {
     Invoke-Action "Turn off Power Throttling / EcoQoS (background or occluded processes keep full speed)" {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' 'PowerThrottlingOff' 1
     }
-    Invoke-Action "Honour timer-resolution requests from occluded/background processes (Windows 11 ignores them by default)" {
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1
+    if ($script:IsWin11) {
+        Invoke-Action "Honour timer-resolution requests from occluded/background processes (Windows 11 ignores them by default)" {
+            Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1
+        }
     }
 }
 
 # ---------------------------------------------------------------------------
 # 3. Windows Update
 # ---------------------------------------------------------------------------
+function Install-UpdateGuard {
+    $dir  = Join-Path $env:ProgramData 'PlayoutPrep'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $file = Join-Path $dir 'Update-Guard.ps1'
+    $body = @'
+$ErrorActionPreference = 'SilentlyContinue'
+# Re-apply the Windows Update lock (Windows remediation tasks may re-enable services/tasks).
+$au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
+New-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -PropertyType DWord -Force | Out-Null
+foreach ($s in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc', 'sedsvc') {
+    $svc = Get-Service -Name $s
+    if ($svc) {
+        if ($svc.Status -ne 'Stopped') { Stop-Service -Name $s -Force }
+        if ($svc.StartType -ne 'Disabled') { Set-Service -Name $s -StartupType Disabled }
+    }
+}
+foreach ($p in '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\', '\Microsoft\Windows\WaaSMedic\') {
+    Get-ScheduledTask -TaskPath $p | Where-Object { $_.State -ne 'Disabled' } | Disable-ScheduledTask | Out-Null
+}
+'@
+    Set-Content -Path $file -Value $body -Encoding ASCII
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $file)
+    $trigger   = New-ScheduledTaskTrigger -AtStartup
+    $rep       = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $trigger.Repetition = $rep.Repetition
+    $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+                    -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName 'Playout-UpdateGuard' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+}
+
 function Invoke-Updates {
-    Write-Log "== Windows Update control ==" 'INFO'
+    $mode = 'BLOCKED'
+    if ($AllowUpdates) { $mode = 'NOTIFY-ONLY (-AllowUpdates)' }
+    Write-Log "== Windows Update: $mode ==" 'INFO'
     $wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $au = "$wu\AU"
 
-    Invoke-Action "Exclude drivers from Windows Update (keeps the NVIDIA driver you installed)" {
+    Invoke-Action "Exclude drivers from Windows Update (keeps the GPU/NIC drivers you installed)" {
         Set-Reg $wu 'ExcludeWUDriversInQualityUpdate' 1
     }
     Invoke-Action "Defer feature updates 365 days and quality updates 30 days" {
@@ -348,33 +456,77 @@ function Invoke-Updates {
         Set-Reg $wu 'DeferQualityUpdatesPeriodInDays' 30
     }
     if ($TargetRelease) {
-        Invoke-Action "Pin Windows 11 feature release to $TargetRelease" {
+        Invoke-Action "Pin feature release to $TargetRelease" {
+            $product = 'Windows 10'
+            if ($script:IsWin11) { $product = 'Windows 11' }
             Set-Reg $wu 'TargetReleaseVersion' 1
             Set-Reg $wu 'TargetReleaseVersionInfo' $TargetRelease 'String'
-            Set-Reg $wu 'ProductVersion' 'Windows 11' 'String'
+            Set-Reg $wu 'ProductVersion' $product 'String'
         }
     }
-    Invoke-Action "Notify-only updates, never auto-reboot with a user logged on, no restart nags" {
-        Set-Reg $au 'NoAutoUpdate' 0
-        Set-Reg $au 'AUOptions' 2
+    Invoke-Action "Block upgrade offers to a newer Windows version" {
+        Set-Reg $wu 'DisableOSUpgrade' 1
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\OSUpgrade' 'ReservationsAllowed' 0
+    }
+    Invoke-Action "Never auto-reboot with a user logged on, no restart nags, no 'sign in and lock after restart'" {
         Set-Reg $au 'NoAutoRebootWithLoggedOnUsers' 1
         Set-Reg $au 'SetAutoRestartNotificationDisable' 1
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'DisableAutomaticRestartSignOn' 1
     }
-    Invoke-Action "Disable Delivery Optimization peering and Store auto-updates" {
+    Invoke-Action "Delivery Optimization: HTTP only, no peering; Store apps: no auto-updates" {
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DODownloadMode' 0
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'AutoDownload' 2
     }
-    if ($Aggressive) {
-        Invoke-Action "AGGRESSIVE: disable automatic updates entirely and stop/disable wuauserv + UsoSvc (enable them manually for patch windows)" {
-            Set-Reg $au 'NoAutoUpdate' 1
-            foreach ($s in 'wuauserv', 'UsoSvc') {
-                if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
-                    Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
-                    Set-Service -Name $s -StartupType Disabled
-                }
+
+    if ($AllowUpdates) {
+        Invoke-Action "Notify-only updates (AUOptions=2), update UI visible, guard task removed" {
+            Set-Reg $au 'NoAutoUpdate' 0
+            Set-Reg $au 'AUOptions' 2
+            Set-Reg $wu 'SetDisableUXWUAccess' 0
+            Unregister-ScheduledTask -TaskName 'Playout-UpdateGuard' -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    Invoke-Action "BLOCK: automatic updates off by policy, Windows Update settings page hidden" {
+        Set-Reg $au 'NoAutoUpdate' 1
+        Set-Reg $wu 'SetDisableUXWUAccess' 1
+    }
+    Invoke-Action "BLOCK: stop and disable Windows Update services ($($script:UpdateServices -join ', '))" {
+        foreach ($s in $script:UpdateServices) { Disable-ServiceBestEffort $s }
+    }
+    Invoke-Action "BLOCK: disable update / orchestrator / remediation scheduled tasks" {
+        Disable-TasksUnder $script:UpdateTaskPaths
+    }
+    Invoke-Action "BLOCK: install SYSTEM task 'Playout-UpdateGuard' (at startup + every 30 min, hidden) that re-applies the block if Windows re-enables anything" {
+        Install-UpdateGuard
+    }
+}
+
+# Menu 14: deliberately open a maintenance window. Re-run section 3 afterwards to lock again.
+function Invoke-UpdateUnlock {
+    Write-Log "== Unlock Windows Update for a maintenance window ==" 'INFO'
+    Invoke-Action "Remove update guard task" {
+        Unregister-ScheduledTask -TaskName 'Playout-UpdateGuard' -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    Invoke-Action "Policies: automatic updates allowed (notify), update UI visible" {
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate' 0
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'AUOptions' 2
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'SetDisableUXWUAccess' 0
+    }
+    Invoke-Action "Services back to Manual (wuauserv, UsoSvc, DoSvc, WaaSMedicSvc where permitted) and update tasks re-enabled" {
+        foreach ($s in $script:UpdateServices) {
+            if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
+                try { Set-Service -Name $s -StartupType Manual -ErrorAction Stop } catch { Write-Log "Could not change $s (protected)." 'WARN' }
+            }
+        }
+        foreach ($p in $script:UpdateTaskPaths) {
+            foreach ($t in @(Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue)) {
+                try { $t | Enable-ScheduledTask -ErrorAction Stop | Out-Null } catch { }
             }
         }
     }
+    Write-Log "Windows Update is open. Patch, reboot, then run menu 3 to lock it again BEFORE going live." 'WARN'
 }
 
 # ---------------------------------------------------------------------------
@@ -393,10 +545,14 @@ function Invoke-Graphics {
         Set-Reg (Get-UserPath 'Software\Microsoft\DirectX\UserGpuPreferences') 'DirectXUserGlobalSettings' 'SwapEffectUpgradeEnable=0;' 'String'
     }
     if ($HAGS -ne 'Leave') {
-        Invoke-Action "Set Hardware-accelerated GPU scheduling = $HAGS (reboot required)" {
-            $v = 1
-            if ($HAGS -eq 'On') { $v = 2 }
-            Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' $v
+        if ($script:Build -ge 19041) {
+            Invoke-Action "Set Hardware-accelerated GPU scheduling = $HAGS (reboot required)" {
+                $v = 1
+                if ($HAGS -eq 'On') { $v = 2 }
+                Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' $v
+            }
+        } else {
+            Write-Log "HAGS needs Windows 10 2004 or newer: skipped." 'WARN'
         }
     }
     if ($DisableMPO) {
@@ -418,7 +574,7 @@ function Invoke-Graphics {
 # 5. Distractions
 # ---------------------------------------------------------------------------
 function Invoke-Distractions {
-    Write-Log "== Focus-stealing popups, notifications, lock screen ==" 'INFO'
+    Write-Log "== Focus-stealing popups, notifications, lock screen, prompts ==" 'INFO'
 
     Invoke-Action "Disable Sticky/Filter/Toggle Keys hotkeys and popups (kiosk user + logon screen)" {
         foreach ($root in @($script:UserRoot, 'Registry::HKEY_USERS\.DEFAULT')) {
@@ -442,6 +598,25 @@ function Invoke-Distractions {
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun' 255
         Set-Reg (Get-UserPath 'Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers') 'DisableAutoplay' 1
     }
+    Invoke-Action "Third-party apps: no SmartScreen prompts and no 'Open File - Security Warning' on copied/downloaded files (security trade-off)" {
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 0
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' 'String'
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'SmartScreenEnabled' 0
+        Set-Reg (Get-UserPath 'Software\Microsoft\Windows\CurrentVersion\Policies\Attachments') 'SaveZoneInformation' 1
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments' 'SaveZoneInformation' 1
+    }
+    if ($script:IsWin11) {
+        $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+        if ($sac -eq 1 -or $sac -eq 2) {
+            Write-Log "Smart App Control is ON/evaluating: it can block unsigned third-party apps. Turn it off in Windows Security > App & browser control (it cannot be re-enabled without reinstalling)." 'WARN'
+        }
+    }
+    Invoke-Action "Suppress the 'allow your PC to be discoverable on this network?' prompt" {
+        New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff' -Force | Out-Null
+    }
+    Invoke-Action "Do not reopen apps after restart (RestartApps off for the kiosk user)" {
+        Set-Reg (Get-UserPath 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon') 'RestartApps' 0
+    }
     Invoke-Action "Disable ads, suggestions, tips, welcome experience and consumer content" {
         $cdm = Get-UserPath 'Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
         foreach ($n in 'ContentDeliveryAllowed','OemPreInstalledAppsEnabled','PreInstalledAppsEnabled','PreInstalledAppsEverEnabled',
@@ -459,7 +634,7 @@ function Invoke-Distractions {
         Set-Reg $cc 'DisableCloudOptimizedContent' 1
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' 'DisablePrivacyExperience' 1
     }
-    Invoke-Action "Disable Widgets, Copilot and clipboard-history hotkey panel" {
+    Invoke-Action "Disable Widgets / News and Interests, Copilot and clipboard-history panel" {
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
         Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds' 'EnableFeeds' 0
         Set-Reg (Get-UserPath 'Software\Policies\Microsoft\Windows\WindowsCopilot') 'TurnOffWindowsCopilot' 1
@@ -468,20 +643,33 @@ function Invoke-Distractions {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Background services, tasks, Defender
+# 6. Background services, tasks, Defender, Edge
 # ---------------------------------------------------------------------------
 function Invoke-Background {
-    Write-Log "== Background tasks, services, Defender ==" 'INFO'
+    Write-Log "== Background tasks, services, maintenance, Defender, Edge ==" 'INFO'
 
+    Invoke-Action "Turn off Automatic Maintenance" {
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
+    }
     $tasks = @(
         '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
         '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
         '\Microsoft\Windows\Application Experience\StartupAppTask',
         '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
         '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
+        '\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask',
         '\Microsoft\Windows\Windows Error Reporting\QueueReporting',
         '\Microsoft\Windows\Feedback\Siuf\DmClient',
-        '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload'
+        '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload',
+        '\Microsoft\Windows\TaskScheduler\Idle Maintenance',
+        '\Microsoft\Windows\TaskScheduler\Maintenance Configurator',
+        '\Microsoft\Windows\TaskScheduler\Regular Maintenance',
+        '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector',
+        '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem',
+        '\Microsoft\Windows\Maps\MapsUpdateTask',
+        '\Microsoft\Windows\Maps\MapsToastTask',
+        '\Microsoft\Windows\Shell\FamilySafetyMonitor',
+        '\Microsoft\Windows\Shell\FamilySafetyRefreshTask'
     )
     foreach ($t in $tasks) {
         Invoke-Action "Disable scheduled task $t" {
@@ -491,7 +679,7 @@ function Invoke-Background {
             }
         }
     }
-    Write-Log "Left untouched on purpose: ScheduledDefrag (it also performs SSD TRIM/retrim)." 'INFO'
+    Write-Log "Left untouched on purpose: ScheduledDefrag (it also performs SSD TRIM/retrim; runs weekly when idle)." 'INFO'
 
     $svcs = @('SysMain', 'DiagTrack', 'dmwappushservice', 'MapsBroker', 'RetailDemo')
     if ($Aggressive) { $svcs += 'WSearch' }
@@ -502,6 +690,22 @@ function Invoke-Background {
                 Set-Service -Name $s -StartupType Disabled
             }
         }
+    }
+
+    Invoke-Action "Edge: no background updater, no startup boost/background mode, no first-run screens" {
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'UpdateDefault' 0
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'AutoUpdateCheckPeriodMinutes' 0
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'StartupBoostEnabled' 0
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'BackgroundModeEnabled' 0
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'HideFirstRunExperience' 1
+        foreach ($t in @(Get-ScheduledTask -TaskName 'MicrosoftEdgeUpdate*' -ErrorAction SilentlyContinue)) {
+            $t | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+        }
+        foreach ($s in 'edgeupdate', 'edgeupdatem') { Disable-ServiceBestEffort $s }
+    }
+
+    Invoke-Action "Defender: no scheduled or catch-up scans, scan CPU capped at 10% (real-time protection stays ON)" {
+        Set-MpPreference -ScanScheduleDay 8 -DisableCatchupFullScan $true -DisableCatchupQuickScan $true -ScanAvgCPULoadFactor 10 -ErrorAction Stop
     }
 
     $paths = @($MediaPaths)
@@ -517,9 +721,6 @@ function Invoke-Background {
     }
 
     if ($Aggressive) {
-        Invoke-Action "AGGRESSIVE: never run Defender's scheduled scan (real-time protection stays on)" {
-            Set-MpPreference -ScanScheduleDay 8 -ErrorAction Stop
-        }
         Invoke-Action "AGGRESSIVE: disable memory compression (reboot required)" {
             Disable-MMAgent -MemoryCompression -ErrorAction Stop
         }
@@ -596,8 +797,10 @@ function Invoke-Debloat {
         'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo', 'Microsoft.PowerAutomateDesktop',
         'Microsoft.XboxApp', 'Microsoft.XboxGamingOverlay', 'Microsoft.XboxGameOverlay',
         'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.Xbox.TCUI', 'Microsoft.XboxIdentityProvider',
-        'Microsoft.549981C3F5F10', 'Microsoft.windowscommunicationsapps', 'Microsoft.OutlookForWindows',
-        'Microsoft.Copilot', 'MicrosoftTeams', 'MSTeams', 'Clipchamp.Clipchamp'
+        'Microsoft.GamingApp', 'Microsoft.549981C3F5F10', 'Microsoft.windowscommunicationsapps',
+        'Microsoft.OutlookForWindows', 'Microsoft.Copilot', 'MicrosoftTeams', 'MSTeams', 'Clipchamp.Clipchamp',
+        'Microsoft.MixedReality.Portal', 'Microsoft.Microsoft3DViewer', 'Microsoft.Print3D',
+        'Microsoft.SkypeApp', 'Microsoft.OneConnect', 'Microsoft.Wallet'
     )
     $prov = @()
     if (-not $WhatIf) { $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue) }
@@ -702,7 +905,7 @@ function Invoke-AutoLogon {
     try {
         if ($AutoLogonMethod -eq 'Sysinternals') {
             if (-not $AutologonExePath -or -not (Test-Path $AutologonExePath)) {
-                throw "-AutologonExePath must point to a downloaded Autologon64.exe"
+                throw "-AutologonExePath must point to a downloaded Autologon64.exe (or use -AutoLogonMethod Registry)"
             }
             & $AutologonExePath $user $dom $plain /accepteula | Out-Null
             Write-Log "Auto-logon configured for $dom\$user via Sysinternals Autologon (encrypted LSA secret)." 'ACTION'
@@ -727,29 +930,45 @@ function Invoke-AutoLogon {
 function Show-Checklist {
     Write-Host @'
 
- Manual steps the script cannot (or should not) do
- -------------------------------------------------
- NVIDIA driver
+ Fresh-install checklist
+ -----------------------
+ Order
+   1. Install Windows, run ONE final patch cycle, reboot until nothing is pending.
+   2. Install GPU / chipset / NIC drivers.
+   3. Run this script (-WhatIf first), reboot.
+   4. Install player software and content, test, image the machine.
+   5. Maintenance later: menu 14 (unlock updates) -> patch -> reboot -> menu 3 (lock again).
+
+ Windows edition / support
+   * Use Pro, Enterprise or IoT Enterprise LTSC. Home ignores many of the policies used here.
+   * Windows 10 no longer receives security updates without ESU; for new installs prefer
+     Windows 11 or LTSC. With updates blocked, keep playout machines on an isolated network.
+   * With Windows Update blocked: Store installs, winget msstore sources and feature-on-demand
+     installs (e.g. .NET Framework 3.5) fail until you unlock (menu 14). Defender definitions
+     stop updating; schedule a maintenance window or import definitions manually.
+   * Smart App Control (Win11 fresh installs) must be switched off manually in Windows Security.
+   * If you want Defender fully off, Tamper Protection must be turned off by hand first.
+
+ GPU (NVIDIA)
    * Install the NVIDIA RTX Enterprise / Production Branch driver (not Game Ready), clean install.
-     Windows Update driver delivery is blocked by section 3, so it stays put.
    * NVIDIA Control Panel > Manage 3D settings > Power management mode: Prefer maximum performance.
-   * Set every output's resolution/refresh rate explicitly; if an output can go dark (projector
-     standby, hot-plug), use an EDID emulator so the desktop layout never collapses.
+   * Set every output's resolution/refresh rate explicitly; use an EDID emulator on outputs that
+     can go dark (projector standby, hot-plug) so the desktop layout never collapses.
    * If you use Mosaic/Sync, configure it before first launching the show.
 
  BIOS/UEFI
    * Restore on AC power loss = Power On.
    * PCIe ASPM = Off; if you see frame-pacing hiccups, limit deep CPU C-states.
-   * Disable onboard devices you don't use (audio/Wi-Fi/Bluetooth) to cut driver noise.
+   * Disable onboard devices you don't use (audio/Wi-Fi/Bluetooth).
 
- vvvv
-   * Test the exported app as the kiosk user on the final output layout, not only in the editor.
-   * Use the same windowing mode (borderless/fullscreen) you will run in production when judging
-     frame pacing; then decide on -HAGS On/Off and -DisableMPO empirically.
+ Player software
+   * Test the final app as the kiosk user on the final output layout, not only in the editor.
+   * Use the windowing mode you will run in production when judging frame pacing; then decide on
+     -HAGS On/Off and -DisableMPO empirically.
 
  Validation
-   * Reboot, let the watchdog start the app, then kill the process once and confirm it returns
-     within ~1 minute.
+   * Reboot, let the watchdog start the app, kill the process once and confirm it returns
+     within ~1 minute. Menu 13 shows the current state.
    * Soak test 24-48 h; watch `nvidia-smi dmon` and the Windows Reliability Monitor.
 
 '@ -ForegroundColor Cyan
@@ -759,19 +978,26 @@ function Show-Checklist {
 # 13. Verification
 # ---------------------------------------------------------------------------
 function Show-Verification {
-    Write-Host "`n== Current state ==" -ForegroundColor Cyan
+    Write-Host "`n== Current state ($($script:OsLabel)) ==" -ForegroundColor Cyan
     Write-Host ("Active power plan   : " + ((powercfg.exe /getactivescheme) -join ' '))
-    $wuDrv = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
-    Write-Host "WU driver exclusion : $wuDrv (1 = on)"
     $hib = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction SilentlyContinue).HibernateEnabled
     Write-Host "HibernateEnabled    : $hib (0 = off)"
-    foreach ($tn in 'Playout-Watchdog', 'Playout-DailyReboot') {
+    $noAu = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue).NoAutoUpdate
+    $wuDrv = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
+    Write-Host "NoAutoUpdate policy : $noAu (1 = blocked)    WU driver exclusion: $wuDrv (1 = on)"
+    $maint = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' -ErrorAction SilentlyContinue).MaintenanceDisabled
+    Write-Host "Auto maintenance off: $maint (1 = off)"
+    foreach ($tn in 'Playout-UpdateGuard', 'Playout-Watchdog', 'Playout-DailyReboot') {
         $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
         if ($t) { Write-Host "Task $tn : $($t.State)" } else { Write-Host "Task $tn : not present" }
     }
-    foreach ($s in 'SysMain', 'DiagTrack', 'wuauserv', 'w32time') {
+    foreach ($s in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc', 'SysMain', 'DiagTrack', 'w32time') {
         $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
-        if ($svc) { Write-Host ("Service {0,-9}   : {1} / {2}" -f $s, $svc.Status, $svc.StartType) }
+        if ($svc) { Write-Host ("Service {0,-13}: {1} / {2}" -f $s, $svc.Status, $svc.StartType) }
+    }
+    if ($script:IsWin11) {
+        $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+        Write-Host "Smart App Control   : $sac (0 = off, 1 = on, 2 = evaluation)"
     }
     if ($AppPath) {
         $pn = [System.IO.Path]::GetFileNameWithoutExtension($AppPath)
@@ -790,7 +1016,7 @@ function Invoke-All {
     Invoke-Distractions
     Invoke-Background
     Invoke-Network
-    if (Confirm-Step "Also run debloat (AppX removal, OneDrive)? This is NOT covered by the restore point") { Invoke-Debloat }
+    if ($IncludeDebloat -or (Confirm-Step "Also run debloat (AppX removal, OneDrive)? This is NOT covered by the restore point")) { Invoke-Debloat }
     Invoke-Resilience
     Write-Log "All sections complete. Auto-logon (10) is separate. Reboot before going live." 'INFO'
 }
@@ -798,30 +1024,46 @@ function Invoke-All {
 function Show-Menu {
     Clear-Host
     Write-Host "=============================================================" -ForegroundColor Cyan
-    Write-Host " vvvv / NVIDIA RTX A2000-T1000 / Windows 11  24/7 playout prep" -ForegroundColor Cyan
-    if ($WhatIf)     { Write-Host " Mode: DRY RUN (-WhatIf) - nothing will change" -ForegroundColor Yellow }
-    if ($Aggressive) { Write-Host " Mode: AGGRESSIVE - dedicated/isolated machines only" -ForegroundColor Yellow }
+    Write-Host " Uninterrupted playout prep - Windows 10/11 ($($script:OsLabel))" -ForegroundColor Cyan
+    if ($WhatIf)        { Write-Host " Mode: DRY RUN (-WhatIf) - nothing will change" -ForegroundColor Yellow }
+    if ($AllowUpdates)  { Write-Host " Mode: updates NOTIFY-ONLY (-AllowUpdates)" -ForegroundColor Yellow }
+    if ($Aggressive)    { Write-Host " Mode: AGGRESSIVE - dedicated/isolated machines only" -ForegroundColor Yellow }
     Write-Host " App: $(if ($AppPath) { $AppPath } else { '(none - pass -AppPath)' })   Kiosk user: $(if ($KioskUser) { $KioskUser } else { '(current user)' })"
     Write-Host "=============================================================" -ForegroundColor Cyan
     Write-Host "  1) Run ALL (except auto-logon; debloat asks first)"
     Write-Host "  2) Power and sleep"
-    Write-Host "  3) Windows Update control"
+    Write-Host "  3) Windows Update: BLOCK (lock)"
     Write-Host "  4) Graphics / GPU-related OS settings"
-    Write-Host "  5) Distractions (popups, notifications, lock screen)"
-    Write-Host "  6) Background tasks/services + Defender exclusions"
+    Write-Host "  5) Distractions (popups, notifications, lock screen, prompts)"
+    Write-Host "  6) Background tasks/services, maintenance, Defender, Edge"
     Write-Host "  7) Network and time"
     Write-Host "  8) Debloat (AppX, OneDrive, telemetry)"
     Write-Host "  9) Resilience (crash dialogs, watchdog, daily reboot)"
     Write-Host " 10) Auto-logon"
-    Write-Host " 11) Post-install checklist (NVIDIA, BIOS, validation)"
+    Write-Host " 11) Fresh-install checklist"
     Write-Host " 12) Show log file location"
     Write-Host " 13) Verify current state"
+    Write-Host " 14) UNLOCK Windows Update for a maintenance window"
     Write-Host "  0) Exit"
     Write-Host "=============================================================" -ForegroundColor Cyan
 }
 
-Write-Log "Session start. Log: $($script:LogFile)" 'INFO'
+Write-Log "Session start. $($script:OsLabel). Log: $($script:LogFile)" 'INFO'
+if ($script:OsInfo.Caption -match 'Home') {
+    Write-Log "Windows Home detected: many policy-based settings are ignored on Home. Use Pro/Enterprise/LTSC for a playout machine." 'WARN'
+}
 Initialize-UserHive
+
+if ($Unattended) {
+    New-SafetyBackup
+    Invoke-All
+    if ($AutoLogonUserName -and $AutoLogonPassword) { Invoke-AutoLogon }
+    Show-Verification
+    Write-Log "Unattended run finished with $($script:ErrorCount) error(s). Reboot before going live." 'INFO'
+    Dismount-UserHive
+    if ($script:ErrorCount -gt 0) { exit 1 }
+    exit 0
+}
 
 do {
     Show-Menu
@@ -840,6 +1082,7 @@ do {
         '11' { Show-Checklist }
         '12' { Write-Host "Log file: $($script:LogFile)" -ForegroundColor Cyan }
         '13' { Show-Verification }
+        '14' { New-SafetyBackup; Invoke-UpdateUnlock }
         '0'  { Write-Log "Session ended by user." 'INFO' }
         default { Write-Host "Invalid selection." -ForegroundColor Yellow }
     }
